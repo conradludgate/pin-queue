@@ -1,12 +1,11 @@
 [package]
-name = "pin-list"
+name = "unsized-pin-list"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.56.0"
-description = "A safe `Pin`-based intrusive doubly linked list"
-repository = "https://github.com/SabrinaJewson/pin-list.rs"
+description = "A safe `Pin`-based intrusive doubly linked list for storing unsized data"
+repository = "https://github.com/conradludgate/unsized-pin-list.rs"
 license = "MIT"
-keywords = ["PinList"]
+keywords = ["PinList", "Unsize"]
 categories = ["data-structures", "no-std"]
 
 [features]

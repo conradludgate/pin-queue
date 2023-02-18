@@ -12,6 +12,7 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::fmt::Debug;
 use core::fmt::Formatter;
+use core::marker::Unsize;
 use core::mem;
 use core::pin::Pin;
 use core::ptr;
@@ -24,13 +25,13 @@ use core::ptr::NonNull;
 /// implementations by using `dyn Trait` syntax, for example:
 ///
 /// ```
-/// type PinListTypes = dyn pin_list::Types<
-///     Id = pin_list::id::Checked,
+/// type PinListTypes = dyn unsized_pin_list::Types<
+///     Id = unsized_pin_list::id::Checked,
 ///     Protected = (),
 ///     Removed = (),
-///     Unprotected = (),
+///     Unprotected = [()],
 /// >;
-/// type PinList = pin_list::PinList<PinListTypes>;
+/// type PinList = unsized_pin_list::PinList<PinListTypes>;
 /// ```
 pub trait Types {
     /// The ID type this list uses to ensure that different [`PinList`]s are not mixed up.
@@ -65,7 +66,7 @@ pub trait Types {
     ///
     /// This is always accessible by shared reference from the node itself without accessing the
     /// list, and is acessible by shared reference from the [`PinList`].
-    type Unprotected;
+    type Unprotected: ?Sized;
 }
 
 /// An intrusive linked list.
@@ -76,24 +77,24 @@ pub struct PinList<T: ?Sized + Types> {
     /// The head of the list.
     ///
     /// If this is `None`, the list is empty.
-    head: Option<NonNull<NodeShared<T>>>,
+    head: Option<NonNull<NodeShared<T, T::Unprotected>>>,
 
     /// The tail of the list.
     ///
     /// Whether this is `None` must remain in sync with whether `head` is `None`.
-    tail: Option<NonNull<NodeShared<T>>>,
+    tail: Option<NonNull<NodeShared<T, T::Unprotected>>>,
 }
 
 /// The state of a node in a list shared between the node's owner and other types.
 ///
 /// This type is only accessed by shared reference because there are multiple places that need to
 /// have non-invalidated pointers to it.
-pub(crate) struct NodeShared<T: ?Sized + Types> {
+pub(crate) struct NodeShared<T: ?Sized + Types, Unprotected: ?Sized> {
     /// State of this node that is protected by the `PinList`.
     pub(crate) protected: UnsafeCell<NodeProtected<T>>,
 
     /// State of this node not protected by the `PinList`.
-    pub(crate) unprotected: T::Unprotected,
+    pub(crate) unprotected: Unprotected,
 }
 
 pub(crate) enum NodeProtected<T: ?Sized + Types> {
@@ -106,10 +107,10 @@ pub(crate) enum NodeProtected<T: ?Sized + Types> {
 
 pub(crate) struct NodeLinked<T: ?Sized + Types> {
     /// The previous node in the linked list.
-    pub(crate) prev: Option<NonNull<NodeShared<T>>>,
+    pub(crate) prev: Option<NonNull<NodeShared<T, T::Unprotected>>>,
 
     /// The next node in the linked list.
-    pub(crate) next: Option<NonNull<NodeShared<T>>>,
+    pub(crate) next: Option<NonNull<NodeShared<T, T::Unprotected>>>,
 
     /// Any extra data the user wants to store in this state.
     pub(crate) data: T::Protected,
@@ -204,7 +205,10 @@ impl<T: ?Sized + Types> PinList<T> {
     /// # Safety
     ///
     /// The node must be present in the list.
-    pub(crate) unsafe fn cursor(&self, current: Option<NonNull<NodeShared<T>>>) -> Cursor<'_, T> {
+    pub(crate) unsafe fn cursor(
+        &self,
+        current: Option<NonNull<NodeShared<T, T::Unprotected>>>,
+    ) -> Cursor<'_, T> {
         Cursor {
             list: self,
             current,
@@ -218,7 +222,7 @@ impl<T: ?Sized + Types> PinList<T> {
     /// removing nodes out from under them).
     pub(crate) unsafe fn cursor_mut(
         &mut self,
-        current: Option<NonNull<NodeShared<T>>>,
+        current: Option<NonNull<NodeShared<T, T::Unprotected>>>,
     ) -> CursorMut<'_, T> {
         CursorMut {
             list: self,
@@ -282,12 +286,12 @@ impl<T: ?Sized + Types> PinList<T> {
     /// # Panics
     ///
     /// Panics if the node is not in its initial state.
-    pub fn push_front<'node>(
+    pub fn push_front<'node, U: Unsize<T::Unprotected>>(
         &mut self,
-        node: Pin<&'node mut Node<T>>,
+        node: Pin<&'node mut Node<T, U>>,
         protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
+        unprotected: U,
+    ) -> Pin<&'node mut InitializedNode<'node, T, U>> {
         self.cursor_ghost_mut()
             .insert_after(node, protected, unprotected)
     }
@@ -297,12 +301,12 @@ impl<T: ?Sized + Types> PinList<T> {
     /// # Panics
     ///
     /// Panics if the node is not in its initial state.
-    pub fn push_back<'node>(
+    pub fn push_back<'node, U: Unsize<T::Unprotected>>(
         &mut self,
-        node: Pin<&'node mut Node<T>>,
+        node: Pin<&'node mut Node<T, U>>,
         protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
+        unprotected: U,
+    ) -> Pin<&'node mut InitializedNode<'node, T, U>> {
         self.cursor_ghost_mut()
             .insert_before(node, protected, unprotected)
     }
@@ -325,7 +329,7 @@ impl<T: ?Sized + Types> Debug for PinList<T> {
 /// bitwise copy — very cheap.
 pub struct Cursor<'list, T: ?Sized + Types> {
     list: &'list PinList<T>,
-    current: Option<NonNull<NodeShared<T>>>,
+    current: Option<NonNull<NodeShared<T, T::Unprotected>>>,
 }
 
 unsafe impl<T: ?Sized + Types> Send for Cursor<'_, T> where
@@ -341,7 +345,7 @@ unsafe impl<T: ?Sized + Types> Sync for Cursor<'_, T> where
 }
 
 impl<'list, T: ?Sized + Types> Cursor<'list, T> {
-    fn current_shared(&self) -> Option<&'list NodeShared<T>> {
+    fn current_shared(&self) -> Option<&'list NodeShared<T, T::Unprotected>> {
         // SAFETY: A cursor always points to a valid node in the list (ensured by
         // `PinList::cursor`).
         self.current.map(|current| unsafe { current.as_ref() })
@@ -428,7 +432,7 @@ where
 /// between the start and end of the list, in which case it is called the ghost cursor.
 pub struct CursorMut<'list, T: ?Sized + Types> {
     pub(crate) list: &'list mut PinList<T>,
-    pub(crate) current: Option<NonNull<NodeShared<T>>>,
+    pub(crate) current: Option<NonNull<NodeShared<T, T::Unprotected>>>,
 }
 
 unsafe impl<T: ?Sized + Types> Send for CursorMut<'_, T> where
@@ -444,7 +448,7 @@ unsafe impl<T: ?Sized + Types> Sync for CursorMut<'_, T> where
 }
 
 impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
-    fn current_shared(&self) -> Option<&NodeShared<T>> {
+    fn current_shared(&self) -> Option<&NodeShared<T, T::Unprotected>> {
         // SAFETY: A cursor always points to a valid node in the list (ensured by
         // `PinList::cursor_mut`).
         self.current.map(|current| unsafe { current.as_ref() })
@@ -471,14 +475,14 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
             NodeProtected::Removed(..) => unsafe { debug_unreachable!() },
         }
     }
-    pub(crate) fn prev_mut(&mut self) -> &mut Option<NonNull<NodeShared<T>>> {
+    pub(crate) fn prev_mut(&mut self) -> &mut Option<NonNull<NodeShared<T, T::Unprotected>>> {
         match self.current {
             // Unwrap because we don't have polonius
             Some(_) => &mut self.current_linked_mut().unwrap().prev,
             None => &mut self.list.tail,
         }
     }
-    pub(crate) fn next_mut(&mut self) -> &mut Option<NonNull<NodeShared<T>>> {
+    pub(crate) fn next_mut(&mut self) -> &mut Option<NonNull<NodeShared<T, T::Unprotected>>> {
         match self.current {
             // Unwrap because we don't have polonius
             Some(_) => &mut self.current_linked_mut().unwrap().next,
@@ -552,12 +556,12 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
     /// # Panics
     ///
     /// Panics if the node is not in its initial state.
-    pub fn insert_before<'node>(
+    pub fn insert_before<'node, U: Unsize<T::Unprotected>>(
         &mut self,
-        node: Pin<&'node mut Node<T>>,
+        node: Pin<&'node mut Node<T, U>>,
         protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
+        unprotected: U,
+    ) -> Pin<&'node mut InitializedNode<'node, T, U>> {
         node.insert_before(self, protected, unprotected)
     }
 
@@ -566,12 +570,12 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
     /// # Panics
     ///
     /// Panics if the node is not in its initial state.
-    pub fn insert_after<'node>(
+    pub fn insert_after<'node, U: Unsize<T::Unprotected>>(
         &mut self,
-        node: Pin<&'node mut Node<T>>,
+        node: Pin<&'node mut Node<T, U>>,
         protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
+        unprotected: U,
+    ) -> Pin<&'node mut InitializedNode<'node, T, U>> {
         node.insert_after(self, protected, unprotected)
     }
 
@@ -580,12 +584,12 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
     /// # Panics
     ///
     /// Panics if the node is not in its initial state.
-    pub fn push_front<'node>(
+    pub fn push_front<'node, U: Unsize<T::Unprotected>>(
         &mut self,
-        node: Pin<&'node mut Node<T>>,
+        node: Pin<&'node mut Node<T, U>>,
         protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
+        unprotected: U,
+    ) -> Pin<&'node mut InitializedNode<'node, T, U>> {
         self.list.push_front(node, protected, unprotected)
     }
 
@@ -594,12 +598,12 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
     /// # Panics
     ///
     /// Panics if the node is not in its initial state.
-    pub fn push_back<'node>(
+    pub fn push_back<'node, U: Unsize<T::Unprotected>>(
         &mut self,
-        node: Pin<&'node mut Node<T>>,
+        node: Pin<&'node mut Node<T, U>>,
         protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
+        unprotected: U,
+    ) -> Pin<&'node mut InitializedNode<'node, T, U>> {
         self.list.push_back(node, protected, unprotected)
     }
 

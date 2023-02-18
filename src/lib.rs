@@ -13,13 +13,13 @@
 //! use std::pin::Pin;
 //! use std::task;
 //! use std::task::Poll;
-//! use pin_list::PinList;
+//! use unsized_pin_list::PinList;
 //!
-//! type PinListTypes = dyn pin_list::Types<
-//!     Id = pin_list::id::Checked,
+//! type PinListTypes = dyn unsized_pin_list::Types<
+//!     Id = unsized_pin_list::id::Checked,
 //!     Protected = task::Waker,
 //!     Removed = (),
-//!     Unprotected = (),
+//!     Unprotected = [()],
 //! >;
 //!
 //! pub struct Mutex<T> {
@@ -40,14 +40,14 @@
 //!             data: UnsafeCell::new(data),
 //!             inner: std::sync::Mutex::new(Inner {
 //!                 locked: false,
-//!                 waiters: PinList::new(pin_list::id::Checked::new()),
+//!                 waiters: PinList::new(unsized_pin_list::id::Checked::new()),
 //!             }),
 //!         }
 //!     }
 //!     pub fn lock(&self) -> Lock<'_, T> {
 //!         Lock {
 //!             mutex: self,
-//!             node: pin_list::Node::new(),
+//!             node: unsized_pin_list::Node::new(),
 //!         }
 //!     }
 //! }
@@ -56,7 +56,7 @@
 //!     pub struct Lock<'mutex, T> {
 //!         mutex: &'mutex Mutex<T>,
 //!         #[pin]
-//!         node: pin_list::Node<PinListTypes>,
+//!         node: unsized_pin_list::Node<PinListTypes, [(); 0]>,
 //!     }
 //!
 //!     impl<T> PinnedDrop for Lock<'_, T> {
@@ -74,11 +74,11 @@
 //!
 //!             match node.reset(&mut inner.waiters) {
 //!                 // If we've cancelled the future like usual, just do that.
-//!                 (pin_list::NodeData::Linked(_waker), ()) => {}
+//!                 (unsized_pin_list::NodeData::Linked(_waker), []) => {}
 //!
 //!                 // Otherwise, we have been woken but aren't around to take the lock. To
 //!                 // prevent deadlocks, pass the notification on to someone else.
-//!                 (pin_list::NodeData::Removed(()), ()) => {
+//!                 (unsized_pin_list::NodeData::Removed(()), []) => {
 //!                     if let Ok(waker) = inner.waiters.cursor_front_mut().remove_current(()) {
 //!                         drop(inner);
 //!                         waker.wake();
@@ -112,7 +112,7 @@
 //!         }
 //!
 //!         // Otherwise, re-register ourselves to be woken when the mutex is unlocked again
-//!         inner.waiters.push_back(this.node, cx.waker().clone(), ());
+//!         inner.waiters.push_back(this.node, cx.waker().clone(), []);
 //!
 //!         Poll::Pending
 //!     }
@@ -180,6 +180,7 @@
     uncommon_codepoints,
 )]
 #![no_std]
+#![feature(unsize)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -217,7 +218,7 @@ mod tests {
         // Use boxes because they better detect double-frees, type mismatches and other errors.
         Protected = Box<u8>,
         Removed = Box<u16>,
-        Unprotected = Box<u32>,
+        Unprotected = [u32],
     >;
     type PinList = crate::PinList<PinListTypes>;
 
@@ -263,8 +264,8 @@ mod tests {
         assert!(node.as_mut().initialized_mut().is_none());
 
         let mut protected = Box::new(0);
-        let unprotected = Box::new(1);
-        list.push_front(node.as_mut(), protected.clone(), unprotected.clone());
+        let unprotected = [1];
+        list.push_front(node.as_mut(), protected.clone(), unprotected);
 
         assert!(!node.is_initial());
 
@@ -338,10 +339,9 @@ mod tests {
 
         let protected = Box::new(0);
         let removed = Box::new(1);
-        let unprotected = Box::new(2);
+        let unprotected = [2];
 
-        let initialized_node =
-            list.push_back(node.as_mut(), protected.clone(), unprotected.clone());
+        let initialized_node = list.push_back(node.as_mut(), protected.clone(), unprotected);
 
         assert_eq!(
             list.cursor_front_mut()
@@ -367,10 +367,9 @@ mod tests {
 
         let protected = Box::new(0);
         let removed = Box::new(1);
-        let unprotected = Box::new(2);
+        let unprotected = [2];
 
-        let initialized_node =
-            list.push_front(node.as_mut(), protected.clone(), unprotected.clone());
+        let initialized_node = list.push_front(node.as_mut(), protected.clone(), unprotected);
 
         let mut cursor = list.cursor_front_mut();
         let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -397,9 +396,13 @@ mod tests {
     fn multinode() {
         let mut list = PinList::new(id::Checked::new());
 
-        let mut nodes = (0..7)
-            .map(|_| Box::pin(crate::Node::new()))
-            .collect::<Box<[_]>>();
+        let mut node0 = Box::pin(crate::Node::new());
+        let mut node1 = Box::pin(crate::Node::new());
+        let mut node2 = Box::pin(crate::Node::new());
+        let mut node3 = Box::pin(crate::Node::new());
+        let mut node4 = Box::pin(crate::Node::new());
+        let mut node5 = Box::pin(crate::Node::new());
+        let mut node6 = Box::pin(crate::Node::new());
 
         fn assert_order<const N: usize>(list: &mut PinList, order: [u8; N]) {
             // Forwards iteration
@@ -408,7 +411,7 @@ mod tests {
                 cursor.move_next();
                 assert_eq!(**cursor.protected().unwrap(), number);
                 assert_eq!(**cursor.protected_mut().unwrap(), number);
-                assert_eq!(**cursor.unprotected().unwrap(), u32::from(number));
+                assert_eq!(cursor.unprotected().unwrap().len(), usize::from(number));
             }
             cursor.move_next();
             assert_eq!(cursor.protected(), None);
@@ -420,7 +423,7 @@ mod tests {
                 cursor.move_previous();
                 assert_eq!(**cursor.protected().unwrap(), number);
                 assert_eq!(**cursor.protected_mut().unwrap(), number);
-                assert_eq!(**cursor.unprotected().unwrap(), u32::from(number));
+                assert_eq!(cursor.unprotected().unwrap().len(), usize::from(number));
             }
             cursor.move_previous();
             assert_eq!(cursor.protected(), None);
@@ -439,88 +442,86 @@ mod tests {
 
         // ghost before; ghost after
         list.cursor_ghost_mut()
-            .insert_before(nodes[0].as_mut(), Box::new(0), Box::new(0));
+            .insert_before(node0.as_mut(), Box::new(0), [0; 0]);
         assert_order(&mut list, [0]);
 
         // ghost before; node after; insert_after
         list.cursor_ghost_mut()
-            .insert_after(nodes[1].as_mut(), Box::new(1), Box::new(1));
+            .insert_after(node1.as_mut(), Box::new(1), [1; 1]);
         assert_order(&mut list, [1, 0]);
 
         // ghost before; node after; insert_before
-        cursor(&mut list, 0).insert_before(nodes[2].as_mut(), Box::new(2), Box::new(2));
+        cursor(&mut list, 0).insert_before(node2.as_mut(), Box::new(2), [2; 2]);
         assert_order(&mut list, [2, 1, 0]);
 
         // node before; ghost after; insert_after
-        cursor(&mut list, 2).insert_after(nodes[3].as_mut(), Box::new(3), Box::new(3));
+        cursor(&mut list, 2).insert_after(node3.as_mut(), Box::new(3), [3; 3]);
         assert_order(&mut list, [2, 1, 0, 3]);
 
         // node before; ghost after; insert_before
         list.cursor_ghost_mut()
-            .insert_before(nodes[4].as_mut(), Box::new(4), Box::new(4));
+            .insert_before(node4.as_mut(), Box::new(4), [4; 4]);
         assert_order(&mut list, [2, 1, 0, 3, 4]);
 
         // node before; node after; insert_after
-        cursor(&mut list, 0).insert_after(nodes[5].as_mut(), Box::new(5), Box::new(5));
+        cursor(&mut list, 0).insert_after(node5.as_mut(), Box::new(5), [5; 5]);
         assert_order(&mut list, [2, 5, 1, 0, 3, 4]);
 
         // node before; node after; insert_before
-        cursor(&mut list, 1).insert_before(nodes[6].as_mut(), Box::new(6), Box::new(6));
+        cursor(&mut list, 1).insert_before(node6.as_mut(), Box::new(6), [6; 6]);
         assert_order(&mut list, [2, 6, 5, 1, 0, 3, 4]);
 
-        fn unlink(
+        fn unlink<const N: usize>(
             list: &mut PinList,
-            nodes: &mut [Pin<Box<crate::Node<PinListTypes>>>],
-            index: u8,
+            node: Pin<&mut crate::Node<PinListTypes, [u32; N]>>,
+            index: usize,
         ) {
-            let node = nodes[usize::from(index)].as_mut();
             let node = node.initialized_mut().expect("already unlinked");
             let (protected, unprotected) = node.unlink(list).unwrap();
-            assert_eq!(*protected, index);
-            assert_eq!(*unprotected, u32::from(index));
+            assert_eq!(*protected as usize, index);
+            assert_eq!(unprotected.len(), index);
         }
 
-        fn remove(
+        fn remove<const N: usize>(
             list: &mut PinList,
-            nodes: &mut [Pin<Box<crate::Node<PinListTypes>>>],
-            index: u8,
+            node: Pin<&mut crate::Node<PinListTypes, [u32; N]>>,
+            index: u16,
         ) {
-            let node = nodes[usize::from(index)].as_mut();
             let node = node.initialized_mut().expect("already unlinked");
             let mut cursor = node.cursor_mut(&mut *list).unwrap();
-            let removed = Box::new(u16::from(index));
-            assert_eq!(*cursor.remove_current(removed).unwrap(), index);
+            let removed = Box::new(index);
+            assert_eq!(u16::from(*cursor.remove_current(removed).unwrap()), index);
             let (removed, unprotected) = node.take_removed(&*list).unwrap();
-            assert_eq!(*removed, u16::from(index));
-            assert_eq!(*unprotected, u32::from(index));
+            assert_eq!(*removed, index);
+            assert_eq!(unprotected.len(), index as usize);
         }
 
         // node before; node after; unlink
-        unlink(&mut list, &mut *nodes, 6);
+        unlink(&mut list, node6.as_mut(), 6);
         assert_order(&mut list, [2, 5, 1, 0, 3, 4]);
 
         // node before; node after; remove
-        remove(&mut list, &mut *nodes, 5);
+        remove(&mut list, node5.as_mut(), 5);
         assert_order(&mut list, [2, 1, 0, 3, 4]);
 
         // node before; ghost after; unlink
-        unlink(&mut list, &mut *nodes, 4);
+        unlink(&mut list, node4.as_mut(), 4);
         assert_order(&mut list, [2, 1, 0, 3]);
 
         // node before; ghost after; remove
-        remove(&mut list, &mut *nodes, 3);
+        remove(&mut list, node3.as_mut(), 3);
         assert_order(&mut list, [2, 1, 0]);
 
         // ghost before; node after; unlink
-        unlink(&mut list, &mut *nodes, 2);
+        unlink(&mut list, node2.as_mut(), 2);
         assert_order(&mut list, [1, 0]);
 
         // ghost before; node after; remove
-        remove(&mut list, &mut *nodes, 1);
+        remove(&mut list, node1.as_mut(), 1);
         assert_order(&mut list, [0]);
 
         // ghost before; ghost after; unlink
-        unlink(&mut list, &mut *nodes, 0);
+        unlink(&mut list, node0.as_mut(), 0);
         assert_order(&mut list, []);
     }
 }
