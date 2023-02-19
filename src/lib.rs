@@ -1,176 +1,4 @@
 //! This crate provides [`PinQueue`], a safe `Pin`-based intrusive linked list for a FIFO queue.
-//!
-//! # Example
-//!
-//! A thread-safe future queue.
-//!
-//! ```
-//! use std::cell::UnsafeCell;
-//! use std::future::Future;
-//! use std::ops::Deref;
-//! use std::ops::DerefMut;
-//! use std::pin::Pin;
-//! use std::task;
-//! use std::task::Poll;
-//! use std::sync::{Mutex, Arc};
-//! use once_cell::sync::Lazy;
-//!
-//! // aliases
-//! type PinQueueTypes = dyn pin_queue::Types<
-//!     Id = pin_queue::id::Checked,
-//!     Value = Mutex<dyn Future<Output = usize>>,
-//! >;
-//! type PinQueue = pin_queue::PinQueue<PinQueueTypes, Arc<_>>;
-//! type Node<V = PinQueueTypes::Value> = pin_queue::Node<PinQueueTypes, V>;
-//!
-//! // global queue
-//! static QUEUE: Lazy<Mutex<PinQueue>> = Lazy::new(|| {
-//!     Mutex::new(PinQueue::new(pin_queue::id::Checked::new()))
-//! });
-//!
-//! // spawn()
-//! let task1 = Arc::new(Node::new(Mutex::new(async { 1 })));
-//! QUEUE.lock().unwrap().push_back(task1);
-//!
-//! let task2 = Arc::new(Node::new(Mutex::new(async { 2 })));
-//! QUEUE.lock().unwrap().push_back(task2);
-//!
-//! // worker
-//! while let Some(task) = QUEUE.lock().unwrap().pop_front() {
-//!     let waker = TaskWaker(task.clone());
-//! }
-//!
-//! // waker
-//! pub struct TaskWaker(Arc<Node>)
-//!
-//! pub struct Mutex<T> {
-//!     data: UnsafeCell<T>,
-//!     inner: std::sync::Mutex<Inner>,
-//! }
-//!
-//! struct Inner {
-//!     locked: bool,
-//!     waiters: PinList<PinListTypes>,
-//! }
-//!
-//! unsafe impl<T> Sync for Mutex<T> {}
-//!
-//! impl<T> Mutex<T> {
-//!     pub fn new(data: T) -> Self {
-//!         Self {
-//!             data: UnsafeCell::new(data),
-//!             inner: std::sync::Mutex::new(Inner {
-//!                 locked: false,
-//!                 waiters: PinList::new(unsized_pin_list::id::Checked::new()),
-//!             }),
-//!         }
-//!     }
-//!     pub fn lock(&self) -> Lock<'_, T> {
-//!         Lock {
-//!             mutex: self,
-//!             node: unsized_pin_list::Node::new(),
-//!         }
-//!     }
-//! }
-//!
-//! pin_project! {
-//!     pub struct Lock<'mutex, T> {
-//!         mutex: &'mutex Mutex<T>,
-//!         #[pin]
-//!         node: unsized_pin_list::Node<PinListTypes, [(); 0]>,
-//!     }
-//!
-//!     impl<T> PinnedDrop for Lock<'_, T> {
-//!         fn drop(this: Pin<&mut Self>) {
-//!             let this = this.project();
-//!             let node = match this.node.initialized_mut() {
-//!                 // The future was cancelled before it could complete.
-//!                 Some(initialized) => initialized,
-//!                 // The future has completed already (or hasn't started); we don't have to do
-//!                 // anything.
-//!                 None => return,
-//!             };
-//!
-//!             let mut inner = this.mutex.inner.lock().unwrap();
-//!
-//!             match node.reset(&mut inner.waiters) {
-//!                 // If we've cancelled the future like usual, just do that.
-//!                 (unsized_pin_list::NodeData::Linked(_waker), []) => {}
-//!
-//!                 // Otherwise, we have been woken but aren't around to take the lock. To
-//!                 // prevent deadlocks, pass the notification on to someone else.
-//!                 (unsized_pin_list::NodeData::Removed(()), []) => {
-//!                     if let Ok(waker) = inner.waiters.cursor_front_mut().remove_current(()) {
-//!                         drop(inner);
-//!                         waker.wake();
-//!                     }
-//!                 }
-//!             }
-//!         }
-//!     }
-//! }
-//!
-//! impl<'mutex, T> Future for Lock<'mutex, T> {
-//!     type Output = Guard<'mutex, T>;
-//!     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-//!         let mut this = self.project();
-//!
-//!         let mut inner = this.mutex.inner.lock().unwrap();
-//!
-//!         if let Some(mut node) = this.node.as_mut().initialized_mut() {
-//!             // Check whether we've been woken up, only continuing if so.
-//!             if let Err(node) = node.take_removed(&inner.waiters) {
-//!                 // If we haven't been woken, re-register our waker and pend.
-//!                 *node.protected_mut(&mut inner.waiters).unwrap() = cx.waker().clone();
-//!                 return Poll::Pending;
-//!             }
-//!         }
-//!
-//!         // If the mutex is unlocked, mark it as locked and return the guard
-//!         if !inner.locked {
-//!             inner.locked = true;
-//!             return Poll::Ready(Guard { mutex: this.mutex });
-//!         }
-//!
-//!         // Otherwise, re-register ourselves to be woken when the mutex is unlocked again
-//!         inner.waiters.push_back(this.node, cx.waker().clone(), []);
-//!
-//!         Poll::Pending
-//!     }
-//! }
-//!
-//! pub struct Guard<'mutex, T> {
-//!     mutex: &'mutex Mutex<T>,
-//! }
-//!
-//! impl<T> Deref for Guard<'_, T> {
-//!     type Target = T;
-//!     fn deref(&self) -> &Self::Target {
-//!         unsafe { &*self.mutex.data.get() }
-//!     }
-//! }
-//! impl<T> DerefMut for Guard<'_, T> {
-//!     fn deref_mut(&mut self) -> &mut Self::Target {
-//!         unsafe { &mut *self.mutex.data.get() }
-//!     }
-//! }
-//!
-//! impl<T> Drop for Guard<'_, T> {
-//!     fn drop(&mut self) {
-//!         let mut inner = self.mutex.inner.lock().unwrap();
-//!         inner.locked = false;
-//!
-//!         if let Ok(waker) = inner.waiters.cursor_front_mut().remove_current(()) {
-//!             drop(inner);
-//!             waker.wake();
-//!         }
-//!     }
-//! }
-//! #
-//! # fn assert_send<T: Send>(_: T) {}
-//! # let mutex = Mutex::new(());
-//! # assert_send(mutex.lock());
-//! ```
 #![warn(
     clippy::pedantic,
     missing_debug_implementations,
@@ -189,42 +17,18 @@
     // I export all the types at the crate root, so this lint is pointless.
     clippy::module_name_repetitions,
 )]
-#![no_std]
-
-#[cfg(feature = "alloc")]
-extern crate alloc;
-
-#[cfg(feature = "std")]
-extern crate std;
 
 pub mod id;
-use core::{
-    cell::UnsafeCell,
-    fmt,
-    marker::PhantomData,
-    ops::{Deref, DerefMut},
-    pin::Pin,
-    ptr::NonNull,
-};
+use core::{cell::UnsafeCell, fmt, marker::PhantomData, ops::Deref, pin::Pin, ptr::NonNull};
+use std::sync::Arc;
 
+// use arc_dyn::{Core, ThinArc};
 pub use id::Id;
 
 mod util;
 
 /// Types used in a [`PinQueue`]. This trait is used to avoid an excessive number of generic
 /// parameters on [`PinQueue`] and related types.
-///
-/// Generally you won't want to implement this trait directly — instead you can create ad-hoc
-/// implementations by using `dyn Trait` syntax, for example:
-///
-/// ```
-/// use std::sync::Arc;
-/// type PinQueueTypes = dyn pin_queue::Types<
-///     Id = pin_queue::id::Checked,
-///     Value = (),
-/// >;
-/// type PinList = unsized_pin_list::PinList<PinQueueTypes, Arc<_>>;
-/// ```
 pub trait Types: 'static {
     /// The ID type this list uses to ensure that different [`PinList`]s are not mixed up.
     ///
@@ -239,74 +43,92 @@ pub trait Types: 'static {
     ///     [`id::Unchecked`] in release.
     type Id: Id;
 
-    /// The value stored in the [`PinQueue`]. Can be a dynamically sized type (eg `dyn Future<Output = ()>`)
-    type Value: ?Sized + 'static;
+    /// The node stored in the [`PinQueue`]
+    type Node: ?Sized;
+}
+
+/// Gets the intrusive component out of a node
+pub trait GetIntrusive<T: ?Sized + Types> {
+    /// From the pinned node, get the intrusive component
+    fn get_intrusive(p: Pin<&T::Node>) -> Pin<&Intrusive<T>>;
 }
 
 /// An intrusive linked-list based FIFO queue
-pub struct PinQueue<T: Types + ?Sized, P: Pointer<T>> {
+pub struct PinQueue<T: Types + ?Sized, P: Pointer<T>, K: GetIntrusive<T>> {
     id: T::Id,
 
     /// The head of the list.
     ///
     /// If this is `None`, the list is empty.
-    head: Option<NonNull<Node<T>>>,
+    head: Option<NonNull<T::Node>>,
 
     /// The tail of the list.
     ///
     /// Whether this is `None` must remain in sync with whether `head` is `None`.
-    tail: Option<NonNull<Node<T>>>,
+    tail: Option<NonNull<T::Node>>,
 
     _pointer: PhantomData<P>,
+    _key: PhantomData<K>,
 }
 
-impl<T: ?Sized + Types, P: Pointer<T>> fmt::Debug for PinQueue<T, P> {
+impl<T: ?Sized + Types, P: Pointer<T>, K: GetIntrusive<T>> fmt::Debug for PinQueue<T, P, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PinQueue").field("id", &self.id).finish()
     }
 }
 
 /// `Pointer` trait represents types that act like owned pointers.
-/// Eg [`Box`](alloc::boxed::Box) or [`Arc`](alloc::sync::Arc).
-pub trait Pointer<T: ?Sized + Types>: Deref<Target = Node<T>> + 'static {
+/// Eg [`Box`] or [`Arc`]
+pub trait Pointer<T: ?Sized + Types>: Deref<Target = T::Node> + 'static {
     /// Turn this pointer into a raw pointer
-    fn into_raw(self) -> *const Node<T>;
+    fn into_raw(self) -> *const T::Node;
     /// # Safety
     /// Must only be called **once** with the output of from [`into_raw`](Pointer::into_raw)
-    unsafe fn from_raw(p: *const Node<T>) -> Self;
+    unsafe fn from_raw(p: *const T::Node) -> Self;
 }
 
-#[cfg(feature = "alloc")]
-impl<T: ?Sized + Types> Pointer<T> for alloc::boxed::Box<Node<T>> {
-    fn into_raw(self) -> *const Node<T> {
-        alloc::boxed::Box::into_raw(self)
+impl<T: ?Sized + Types> Pointer<T> for Box<T::Node> {
+    fn into_raw(self) -> *const T::Node {
+        Box::into_raw(self)
     }
 
-    unsafe fn from_raw(p: *const Node<T>) -> Self {
+    unsafe fn from_raw(p: *const T::Node) -> Self {
         // SAFETY: guaranteed by caller
-        unsafe { alloc::boxed::Box::from_raw(p as _) }
+        unsafe { Box::from_raw(p as _) }
     }
 }
 
-#[cfg(feature = "alloc")]
-impl<T: ?Sized + Types> Pointer<T> for alloc::sync::Arc<Node<T>> {
-    fn into_raw(self) -> *const Node<T> {
-        alloc::sync::Arc::into_raw(self)
+impl<T: ?Sized + Types> Pointer<T> for Arc<T::Node> {
+    fn into_raw(self) -> *const T::Node {
+        Arc::into_raw(self)
     }
 
-    unsafe fn from_raw(p: *const Node<T>) -> Self {
+    unsafe fn from_raw(p: *const T::Node) -> Self {
         // SAFETY: guaranteed by caller
-        unsafe { alloc::sync::Arc::from_raw(p) }
+        unsafe { Arc::from_raw(p) }
     }
 }
 
-#[derive(Debug)]
 /// The error returned by [`PinQueue::push_back`] when the [`Node`] is already in a [`PinQueue`]
 pub struct AlreadyInsertedError<P>(pub Pin<P>);
 
-impl<T: ?Sized + Types, P> PinQueue<T, P>
+impl<P> fmt::Debug for AlreadyInsertedError<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AlreadyInsertedError")
+    }
+}
+impl<P> fmt::Display for AlreadyInsertedError<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("node was already inserted into a PinQueue")
+    }
+}
+#[cfg(feature = "std")]
+impl<P> std::error::Error for AlreadyInsertedError<P> {}
+
+impl<T: ?Sized + Types, P, K> PinQueue<T, P, K>
 where
     P: Pointer<T>,
+    K: GetIntrusive<T>,
 {
     /// Create a new empty `PinQueue` from a unique ID.
     pub fn new(id: id::Unique<T::Id>) -> Self {
@@ -315,6 +137,7 @@ where
             head: None,
             tail: None,
             _pointer: PhantomData,
+            _key: PhantomData,
         }
     }
 
@@ -323,13 +146,18 @@ where
     /// # Errors
     /// This will fail if the node is already inserted into another queue
     pub fn push_back(&mut self, node: Pin<P>) -> Result<(), AlreadyInsertedError<P>> {
-        if !self.id.acquire(&node.intrusive.lock) {
+        if !self.id.acquire(&K::get_intrusive(node.as_ref()).lock) {
             return Err(AlreadyInsertedError(node));
         };
         let node = unsafe { Pin::into_inner_unchecked(node) };
         let node = unsafe { NonNull::new_unchecked(node.into_raw() as *mut _) };
         if let Some(tail) = self.tail {
-            unsafe { (*tail.as_ref().intrusive.pointers.get()).next = Some(node) }
+            unsafe {
+                (*K::get_intrusive(Pin::new_unchecked(tail.as_ref()))
+                    .pointers
+                    .get())
+                .next = Some(node);
+            }
         }
         self.head = Some(self.head.unwrap_or(node));
         self.tail = Some(node);
@@ -339,16 +167,36 @@ where
     /// Take the first node from the queue
     pub fn pop_front(&mut self) -> Option<Pin<P>> {
         let node = self.head?;
-        self.head = unsafe { (*node.as_ref().intrusive.pointers.get()).next };
-        debug_assert!(self.id.release(unsafe { &node.as_ref().intrusive.lock }));
-        unsafe { Some(Pin::new_unchecked(P::from_raw(node.as_ptr()))) }
+        let node = unsafe { Pin::new_unchecked(P::from_raw(node.as_ptr())) };
+        let intrusive = K::get_intrusive(node.as_ref());
+        self.head = unsafe { (*intrusive.pointers.get()).next };
+        debug_assert!(self.id.release(&intrusive.lock));
+        Some(node)
     }
 }
 
-/// A node that can be inserted into a [`PinQueue`]
-pub struct Node<T: Types + ?Sized, V: ?Sized = <T as Types>::Value> {
-    pub(crate) intrusive: Intrusive<T>,
-    pub(crate) value: V,
+unsafe impl<T: ?Sized + Types> Send for Intrusive<T> where <T::Id as id::Id>::Atomic: Send {}
+
+unsafe impl<T: ?Sized + Types> Sync for Intrusive<T> where
+    // Required because it is owned by this type and will be dropped by it.
+    <T::Id as id::Id>::Atomic: Sync
+{
+}
+
+unsafe impl<T: ?Sized + Types, P: Pointer<T>, K: GetIntrusive<T>> Send for PinQueue<T, P, K>
+where
+    T::Id: Send,
+    T::Node: Send + Sync,
+    P: Send,
+{
+}
+
+unsafe impl<T: ?Sized + Types, P: Pointer<T>, K: GetIntrusive<T>> Sync for PinQueue<T, P, K>
+where
+    T::Id: Sync,
+    T::Node: Send + Sync,
+    P: Sync,
+{
 }
 
 /// The intrusive type that you stuff into your node
@@ -367,68 +215,72 @@ impl<T: ?Sized + Types> fmt::Debug for Intrusive<T> {
 }
 
 struct Pointers<T: Types + ?Sized> {
-    // /// The previous node in the linked list.
-    // pub(crate) prev: Option<NonNull<MyNode<T>>>,
     /// The next node in the linked list.
-    pub(crate) next: Option<NonNull<Node<T>>>,
+    pub(crate) next: Option<NonNull<T::Node>>,
 }
 
-impl<T: Types + ?Sized, V: ?Sized> Deref for Node<T, V> {
-    type Target = V;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
-
-impl<T: Types + ?Sized, V: ?Sized> DerefMut for Node<T, V> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.value
-    }
-}
-
-impl<T: Types + ?Sized, V> Node<T, V> {
+impl<T: Types + ?Sized> Intrusive<T> {
     /// Create a new node
-    pub fn new(value: V) -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             lock: <T::Id as id::Id>::unset(),
-            pointers: UnsafeCell::new(Pointers {
-                // prev: None,
-                next: None,
-            }),
-            value,
+            pointers: UnsafeCell::new(Pointers { next: None }),
         }
-    }
-    /// Take the value from this node
-    pub fn into_inner(self) -> V {
-        self.value
     }
 }
 
-#[cfg(all(test, feature = "std"))]
-mod tests {
-    use crate::{id, Node, PinQueue};
-    use alloc::string::ToString;
-    use alloc::sync::Arc;
-    use core::fmt::Display;
+impl<T: Types + ?Sized> Default for Intrusive<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    type MyTypes = dyn crate::Types<Id = id::Checked, Value = dyn Display>;
+#[cfg(test)]
+mod tests {
+    use crate::{id, PinQueue};
+    use core::fmt::Display;
+    use core::pin::Pin;
+    use std::sync::Arc;
+
+    type MyTypes = dyn crate::Types<Id = id::Checked, Node = Node<dyn Display>>;
+    pin_project_lite::pin_project!(
+        struct Node<V: ?Sized> {
+            #[pin]
+            intrusive: crate::Intrusive<MyTypes>,
+            value: V,
+        }
+    );
+    impl<V> Node<V> {
+        pub fn new(value: V) -> Self {
+            Self {
+                intrusive: crate::Intrusive::new(),
+                value,
+            }
+        }
+    }
+    struct Key;
+    impl crate::GetIntrusive<MyTypes> for Key {
+        fn get_intrusive(p: Pin<&Node<dyn Display>>) -> Pin<&crate::Intrusive<MyTypes>> {
+            p.project_ref().intrusive
+        }
+    }
 
     #[test]
     fn my_list() {
-        let mut list = PinQueue::<MyTypes, Arc<_>>::new(id::Checked::new());
+        let mut list = PinQueue::<MyTypes, Arc<_>, Key>::new(id::Checked::new());
         list.push_back(Arc::pin(Node::new(1))).unwrap();
         list.push_back(Arc::pin(Node::new("hello"))).unwrap();
 
-        assert_eq!(list.pop_front().unwrap().to_string(), "1");
-        assert_eq!(list.pop_front().unwrap().to_string(), "hello");
+        assert_eq!(list.pop_front().unwrap().value.to_string(), "1");
+        assert_eq!(list.pop_front().unwrap().value.to_string(), "hello");
         assert!(list.pop_front().is_none());
     }
 
     #[test]
     fn my_list_push_back_error() {
-        let mut list1 = PinQueue::<MyTypes, Arc<_>>::new(id::Checked::new());
-        let mut list2 = PinQueue::<MyTypes, Arc<_>>::new(id::Checked::new());
+        let mut list1 = PinQueue::<MyTypes, Arc<_>, Key>::new(id::Checked::new());
+        let mut list2 = PinQueue::<MyTypes, Arc<_>, Key>::new(id::Checked::new());
 
         let val = Arc::pin(Node::new(1));
         list1.push_back(val.clone()).unwrap();

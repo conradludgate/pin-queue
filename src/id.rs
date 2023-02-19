@@ -162,7 +162,7 @@ mod unchecked {
     // SAFETY: Ensured by caller in `Unchecked::new`
     unsafe impl Id for Unchecked {
         type Atomic = ();
-        
+
         fn read_relaxed(_this: &()) -> Option<Self> {
             Some(Unchecked)
         }

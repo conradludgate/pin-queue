@@ -8,18 +8,8 @@ license = "MIT"
 keywords = ["PinQueue"]
 categories = ["data-structures", "no-std"]
 
-[features]
-default = ["std"]
-alloc = []
-std = ["alloc"]
-
 [dependencies]
-pin-project-lite = "0.2.9"
-pinned-aliasable = "0.1.3"
 
 [dev-dependencies]
-pin-utils = "0.1.0"
-once_cell = "1"
+pin-project-lite = "0.2"
 
-[package.metadata.docs.rs]
-rustdoc-args = ["--cfg", "doc_nightly"]
