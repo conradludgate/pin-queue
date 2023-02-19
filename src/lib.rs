@@ -1,11 +1,10 @@
-//! This crate provides `PinList`, a safe `Pin`-based intrusive doubly linked list.
+//! This crate provides [`PinQueue`], a safe `Pin`-based intrusive linked list for a FIFO queue.
 //!
 //! # Example
 //!
-//! A thread-safe unfair async mutex.
+//! A thread-safe future queue.
 //!
 //! ```
-//! use pin_project_lite::pin_project;
 //! use std::cell::UnsafeCell;
 //! use std::future::Future;
 //! use std::ops::Deref;
@@ -13,14 +12,36 @@
 //! use std::pin::Pin;
 //! use std::task;
 //! use std::task::Poll;
-//! use unsized_pin_list::PinList;
+//! use std::sync::{Mutex, Arc};
+//! use once_cell::sync::Lazy;
 //!
-//! type PinListTypes = dyn unsized_pin_list::Types<
-//!     Id = unsized_pin_list::id::Checked,
-//!     Protected = task::Waker,
-//!     Removed = (),
-//!     Unprotected = [()],
+//! // aliases
+//! type PinQueueTypes = dyn pin_queue::Types<
+//!     Id = pin_queue::id::Checked,
+//!     Value = Mutex<dyn Future<Output = usize>>,
 //! >;
+//! type PinQueue = pin_queue::PinQueue<PinQueueTypes, Arc<_>>;
+//! type Node<V = PinQueueTypes::Value> = pin_queue::Node<PinQueueTypes, V>;
+//!
+//! // global queue
+//! static QUEUE: Lazy<Mutex<PinQueue>> = Lazy::new(|| {
+//!     Mutex::new(PinQueue::new(pin_queue::id::Checked::new()))
+//! });
+//!
+//! // spawn()
+//! let task1 = Arc::new(Node::new(Mutex::new(async { 1 })));
+//! QUEUE.lock().unwrap().push_back(task1);
+//!
+//! let task2 = Arc::new(Node::new(Mutex::new(async { 2 })));
+//! QUEUE.lock().unwrap().push_back(task2);
+//!
+//! // worker
+//! while let Some(task) = QUEUE.lock().unwrap().pop_front() {
+//!     let waker = TaskWaker(task.clone());
+//! }
+//!
+//! // waker
+//! pub struct TaskWaker(Arc<Node>)
 //!
 //! pub struct Mutex<T> {
 //!     data: UnsafeCell<T>,
@@ -162,25 +183,13 @@
     unused_qualifications
 )]
 #![allow(
-    clippy::items_after_statements,
-
     // Repetition is used in `Send`+`Sync` bounds so each one can be individually commented.
     clippy::type_repetition_in_bounds,
 
-    // This is a silly lint; I always turbofish the transmute so it's fine
-    clippy::transmute_ptr_to_ptr,
-
-    // Has false positives: https://github.com/rust-lang/rust-clippy/issues/7812
-    clippy::redundant_closure,
-
     // I export all the types at the crate root, so this lint is pointless.
     clippy::module_name_repetitions,
-
-    // `ǃ` (latin letter retroflex click) is used in the tests for a never type
-    uncommon_codepoints,
 )]
 #![no_std]
-#![feature(unsize)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -189,339 +198,240 @@ extern crate alloc;
 extern crate std;
 
 pub mod id;
+use core::{
+    cell::UnsafeCell,
+    fmt,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    ptr::NonNull,
+};
+
 pub use id::Id;
-
-mod list;
-pub use list::{Cursor, CursorMut, PinList, Types};
-
-mod node;
-pub use node::{InitializedNode, Node, NodeData};
 
 mod util;
 
+/// Types used in a [`PinQueue`]. This trait is used to avoid an excessive number of generic
+/// parameters on [`PinQueue`] and related types.
+///
+/// Generally you won't want to implement this trait directly — instead you can create ad-hoc
+/// implementations by using `dyn Trait` syntax, for example:
+///
+/// ```
+/// use std::sync::Arc;
+/// type PinQueueTypes = dyn pin_queue::Types<
+///     Id = pin_queue::id::Checked,
+///     Value = (),
+/// >;
+/// type PinList = unsized_pin_list::PinList<PinQueueTypes, Arc<_>>;
+/// ```
+pub trait Types: 'static {
+    /// The ID type this list uses to ensure that different [`PinList`]s are not mixed up.
+    ///
+    /// This crate provides a couple built-in ID types, but you can also define your own:
+    /// - [`id::Checked`]:
+    ///     IDs are allocated with a single global atomic `u64` counter.
+    /// - [`id::Unchecked`]:
+    ///     The responsibility is left up to the user to ensure that different [`PinList`]s are not
+    ///     incorrectly mixed up. Using this is `unsafe`.
+    /// - [`id::DebugChecked`]:
+    ///     Equivalent to [`id::Checked`] when `debug_assertions` are enabled, but
+    ///     [`id::Unchecked`] in release.
+    type Id: Id;
+
+    /// The value stored in the [`PinQueue`]. Can be a dynamically sized type (eg `dyn Future<Output = ()>`)
+    type Value: ?Sized + 'static;
+}
+
+/// An intrusive linked-list based FIFO queue
+pub struct PinQueue<T: Types + ?Sized, P: Pointer<T>> {
+    id: T::Id,
+
+    /// The head of the list.
+    ///
+    /// If this is `None`, the list is empty.
+    head: Option<NonNull<Node<T>>>,
+
+    /// The tail of the list.
+    ///
+    /// Whether this is `None` must remain in sync with whether `head` is `None`.
+    tail: Option<NonNull<Node<T>>>,
+
+    _pointer: PhantomData<P>,
+}
+
+impl<T: ?Sized + Types, P: Pointer<T>> fmt::Debug for PinQueue<T, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PinQueue").field("id", &self.id).finish()
+    }
+}
+
+/// `Pointer` trait represents types that act like owned pointers.
+/// Eg [`Box`](alloc::boxed::Box) or [`Arc`](alloc::sync::Arc).
+pub trait Pointer<T: ?Sized + Types>: Deref<Target = Node<T>> + 'static {
+    /// Turn this pointer into a raw pointer
+    fn into_raw(self) -> *const Node<T>;
+    /// # Safety
+    /// Must only be called **once** with the output of from [`into_raw`](Pointer::into_raw)
+    unsafe fn from_raw(p: *const Node<T>) -> Self;
+}
+
+#[cfg(feature = "alloc")]
+impl<T: ?Sized + Types> Pointer<T> for alloc::boxed::Box<Node<T>> {
+    fn into_raw(self) -> *const Node<T> {
+        alloc::boxed::Box::into_raw(self)
+    }
+
+    unsafe fn from_raw(p: *const Node<T>) -> Self {
+        // SAFETY: guaranteed by caller
+        unsafe { alloc::boxed::Box::from_raw(p as _) }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T: ?Sized + Types> Pointer<T> for alloc::sync::Arc<Node<T>> {
+    fn into_raw(self) -> *const Node<T> {
+        alloc::sync::Arc::into_raw(self)
+    }
+
+    unsafe fn from_raw(p: *const Node<T>) -> Self {
+        // SAFETY: guaranteed by caller
+        unsafe { alloc::sync::Arc::from_raw(p) }
+    }
+}
+
+#[derive(Debug)]
+/// The error returned by [`PinQueue::push_back`] when the [`Node`] is already in a [`PinQueue`]
+pub struct AlreadyInsertedError<P>(pub Pin<P>);
+
+impl<T: ?Sized + Types, P> PinQueue<T, P>
+where
+    P: Pointer<T>,
+{
+    /// Create a new empty `PinQueue` from a unique ID.
+    pub fn new(id: id::Unique<T::Id>) -> Self {
+        PinQueue {
+            id: id.into_inner(),
+            head: None,
+            tail: None,
+            _pointer: PhantomData,
+        }
+    }
+
+    /// Insert the node into the back of the queue.
+    ///
+    /// # Errors
+    /// This will fail if the node is already inserted into another queue
+    pub fn push_back(&mut self, node: Pin<P>) -> Result<(), AlreadyInsertedError<P>> {
+        if !self.id.acquire(&node.intrusive.lock) {
+            return Err(AlreadyInsertedError(node));
+        };
+        let node = unsafe { Pin::into_inner_unchecked(node) };
+        let node = unsafe { NonNull::new_unchecked(node.into_raw() as *mut _) };
+        if let Some(tail) = self.tail {
+            unsafe { (*tail.as_ref().intrusive.pointers.get()).next = Some(node) }
+        }
+        self.head = Some(self.head.unwrap_or(node));
+        self.tail = Some(node);
+        Ok(())
+    }
+
+    /// Take the first node from the queue
+    pub fn pop_front(&mut self) -> Option<Pin<P>> {
+        let node = self.head?;
+        self.head = unsafe { (*node.as_ref().intrusive.pointers.get()).next };
+        debug_assert!(self.id.release(unsafe { &node.as_ref().intrusive.lock }));
+        unsafe { Some(Pin::new_unchecked(P::from_raw(node.as_ptr()))) }
+    }
+}
+
+/// A node that can be inserted into a [`PinQueue`]
+pub struct Node<T: Types + ?Sized, V: ?Sized = <T as Types>::Value> {
+    pub(crate) intrusive: Intrusive<T>,
+    pub(crate) value: V,
+}
+
+/// The intrusive type that you stuff into your node
+pub struct Intrusive<T: Types + ?Sized> {
+    pub(crate) lock: <T::Id as id::Id>::Atomic,
+    // locked by the `lock` field
+    pub(crate) pointers: UnsafeCell<Pointers<T>>,
+}
+
+impl<T: ?Sized + Types> fmt::Debug for Intrusive<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Intrusive")
+            .field("id", &<T::Id as id::Id>::read_relaxed(&self.lock))
+            .finish()
+    }
+}
+
+struct Pointers<T: Types + ?Sized> {
+    // /// The previous node in the linked list.
+    // pub(crate) prev: Option<NonNull<MyNode<T>>>,
+    /// The next node in the linked list.
+    pub(crate) next: Option<NonNull<Node<T>>>,
+}
+
+impl<T: Types + ?Sized, V: ?Sized> Deref for Node<T, V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T: Types + ?Sized, V: ?Sized> DerefMut for Node<T, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+impl<T: Types + ?Sized, V> Node<T, V> {
+    /// Create a new node
+    pub fn new(value: V) -> Self {
+        Self {
+            lock: <T::Id as id::Id>::unset(),
+            pointers: UnsafeCell::new(Pointers {
+                // prev: None,
+                next: None,
+            }),
+            value,
+        }
+    }
+    /// Take the value from this node
+    pub fn into_inner(self) -> V {
+        self.value
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use crate::id;
-    use core::pin::Pin;
-    use pin_utils::pin_mut as pin;
-    use std::boxed::Box;
-    use std::panic;
-    use std::process::abort;
-    use std::ptr;
+    use crate::{id, Node, PinQueue};
+    use alloc::string::ToString;
+    use alloc::sync::Arc;
+    use core::fmt::Display;
 
-    // Never type, but it's actually latin letter retroflex click
-    #[derive(Debug, PartialEq)]
-    enum ǃ {}
-
-    type PinListTypes = dyn crate::Types<
-        Id = id::Checked,
-        // Use boxes because they better detect double-frees, type mismatches and other errors.
-        Protected = Box<u8>,
-        Removed = Box<u16>,
-        Unprotected = [u32],
-    >;
-    type PinList = crate::PinList<PinListTypes>;
+    type MyTypes = dyn crate::Types<Id = id::Checked, Value = dyn Display>;
 
     #[test]
-    fn empty_lists() {
-        let mut list = PinList::new(id::Checked::new());
-        let list_ptr: *const _ = &list;
+    fn my_list() {
+        let mut list = PinQueue::<MyTypes, Arc<_>>::new(id::Checked::new());
+        list.push_back(Arc::pin(Node::new(1))).unwrap();
+        list.push_back(Arc::pin(Node::new("hello"))).unwrap();
 
-        let assert_ghost_cursor = |cursor: crate::Cursor<'_, _>| {
-            assert!(ptr::eq(cursor.list(), list_ptr));
-            assert_eq!(cursor.protected(), None);
-            assert_eq!(cursor.unprotected(), None);
-        };
-        let assert_ghost_cursor_mut = |mut cursor: crate::CursorMut<'_, _>| {
-            assert!(ptr::eq(cursor.list(), list_ptr));
-            assert_eq!(cursor.protected(), None);
-            assert_eq!(cursor.protected_mut(), None);
-            assert_eq!(cursor.unprotected(), None);
-            assert_eq!(cursor.remove_current(Box::new(5)), Err(Box::new(5)));
-            assert!(!cursor.remove_current_with(|_| abort()));
-            assert!(!cursor.remove_current_with_or(|_| abort(), || abort()));
-            assert_ghost_cursor(cursor.as_shared());
-        };
-
-        assert!(list.is_empty());
-
-        assert_ghost_cursor(list.cursor_ghost());
-        assert_ghost_cursor(list.cursor_front());
-        assert_ghost_cursor(list.cursor_back());
-        assert_ghost_cursor_mut(list.cursor_ghost_mut());
-        assert_ghost_cursor_mut(list.cursor_front_mut());
-        assert_ghost_cursor_mut(list.cursor_back_mut());
+        assert_eq!(list.pop_front().unwrap().to_string(), "1");
+        assert_eq!(list.pop_front().unwrap().to_string(), "hello");
+        assert!(list.pop_front().is_none());
     }
 
     #[test]
-    fn single_node_with_unlink() {
-        let mut list = PinList::new(id::Checked::new());
+    fn my_list_push_back_error() {
+        let mut list1 = PinQueue::<MyTypes, Arc<_>>::new(id::Checked::new());
+        let mut list2 = PinQueue::<MyTypes, Arc<_>>::new(id::Checked::new());
 
-        let node = crate::Node::new();
-        pin!(node);
-        assert!(node.is_initial());
-        assert!(node.initialized().is_none());
-        assert!(node.as_mut().initialized_mut().is_none());
-
-        let mut protected = Box::new(0);
-        let unprotected = [1];
-        list.push_front(node.as_mut(), protected.clone(), unprotected);
-
-        assert!(!node.is_initial());
-
-        let initialized = node.initialized().unwrap();
-        assert_eq!(initialized.unprotected(), &unprotected);
-        assert_eq!(initialized.protected(&list), Some(&protected));
-        assert_eq!(initialized.protected_mut(&mut list), Some(&mut protected));
-
-        let initialized = node.as_mut().initialized_mut().unwrap();
-        assert_eq!(initialized.unprotected(), &unprotected);
-        assert_eq!(initialized.protected(&list), Some(&protected));
-        assert_eq!(initialized.protected_mut(&mut list), Some(&mut protected));
-
-        assert!(!list.is_empty());
-
-        let check_cursor = |mut cursor: crate::Cursor<'_, _>| {
-            assert_eq!(cursor.protected().unwrap(), &protected);
-            assert_eq!(cursor.unprotected().unwrap(), &unprotected);
-            cursor.move_next();
-            assert_eq!(cursor.protected(), None);
-            for _ in 0..10 {
-                cursor.move_previous();
-                assert_eq!(cursor.protected().unwrap(), &protected);
-                cursor.move_previous();
-                assert_eq!(cursor.protected(), None);
-            }
-        };
-        let check_cursor_mut = |mut cursor: crate::CursorMut<'_, _>| {
-            assert_eq!(cursor.protected().unwrap(), &protected);
-            assert_eq!(cursor.protected_mut().unwrap(), &protected);
-            assert_eq!(cursor.unprotected().unwrap(), &unprotected);
-            for _ in 0..7 {
-                cursor.move_next();
-                assert_eq!(cursor.protected(), None);
-                cursor.move_next();
-                assert_eq!(cursor.protected().unwrap(), &protected);
-            }
-            for _ in 0..10 {
-                cursor.move_previous();
-                assert_eq!(cursor.protected(), None);
-                cursor.move_previous();
-                assert_eq!(cursor.protected().unwrap(), &protected);
-            }
-            check_cursor(cursor.as_shared());
-            check_cursor(cursor.into_shared());
-        };
-
-        check_cursor(list.cursor_front());
-        check_cursor(list.cursor_back());
-        check_cursor_mut(list.cursor_front_mut());
-        check_cursor_mut(list.cursor_back_mut());
-
-        assert_eq!(
-            initialized.unlink(&mut list).unwrap(),
-            (protected, unprotected)
-        );
-
-        assert!(node.is_initial());
-        assert!(node.initialized().is_none());
-        assert!(node.as_mut().initialized_mut().is_none());
-
-        assert!(list.is_empty());
-    }
-
-    #[test]
-    fn removal() {
-        let mut list = PinList::new(id::Checked::new());
-
-        let node = crate::Node::new();
-        pin!(node);
-
-        let protected = Box::new(0);
-        let removed = Box::new(1);
-        let unprotected = [2];
-
-        let initialized_node = list.push_back(node.as_mut(), protected.clone(), unprotected);
-
-        assert_eq!(
-            list.cursor_front_mut()
-                .remove_current(removed.clone())
-                .unwrap(),
-            protected
-        );
-
-        assert_eq!(
-            initialized_node.take_removed(&list).unwrap(),
-            (removed, unprotected)
-        );
-        assert!(node.is_initial());
-        assert!(list.is_empty());
-    }
-
-    #[test]
-    fn removal_fallback() {
-        let mut list = PinList::new(id::Checked::new());
-
-        let node = crate::Node::new();
-        pin!(node);
-
-        let protected = Box::new(0);
-        let removed = Box::new(1);
-        let unprotected = [2];
-
-        let initialized_node = list.push_front(node.as_mut(), protected.clone(), unprotected);
-
-        let mut cursor = list.cursor_front_mut();
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            cursor.remove_current_with_or(
-                |p| {
-                    assert_eq!(p, protected);
-                    panic::panic_any(491_u32)
-                },
-                || removed.clone(),
-            )
-        }));
-        assert_eq!(cursor.protected(), None);
-        assert_eq!(res.unwrap_err().downcast::<u32>().unwrap(), Box::new(491));
-
-        assert_eq!(
-            initialized_node.take_removed(&list).unwrap(),
-            (removed, unprotected),
-        );
-        assert!(node.is_initial());
-        assert!(list.is_empty());
-    }
-
-    #[test]
-    fn multinode() {
-        let mut list = PinList::new(id::Checked::new());
-
-        let mut node0 = Box::pin(crate::Node::new());
-        let mut node1 = Box::pin(crate::Node::new());
-        let mut node2 = Box::pin(crate::Node::new());
-        let mut node3 = Box::pin(crate::Node::new());
-        let mut node4 = Box::pin(crate::Node::new());
-        let mut node5 = Box::pin(crate::Node::new());
-        let mut node6 = Box::pin(crate::Node::new());
-
-        fn assert_order<const N: usize>(list: &mut PinList, order: [u8; N]) {
-            // Forwards iteration
-            let mut cursor = list.cursor_ghost_mut();
-            for number in order {
-                cursor.move_next();
-                assert_eq!(**cursor.protected().unwrap(), number);
-                assert_eq!(**cursor.protected_mut().unwrap(), number);
-                assert_eq!(cursor.unprotected().unwrap().len(), usize::from(number));
-            }
-            cursor.move_next();
-            assert_eq!(cursor.protected(), None);
-            assert_eq!(cursor.protected_mut(), None);
-            assert_eq!(cursor.unprotected(), None);
-
-            // Reverse iteration
-            for number in order.into_iter().rev() {
-                cursor.move_previous();
-                assert_eq!(**cursor.protected().unwrap(), number);
-                assert_eq!(**cursor.protected_mut().unwrap(), number);
-                assert_eq!(cursor.unprotected().unwrap().len(), usize::from(number));
-            }
-            cursor.move_previous();
-            assert_eq!(cursor.protected(), None);
-            assert_eq!(cursor.protected_mut(), None);
-            assert_eq!(cursor.unprotected(), None);
-        }
-
-        fn cursor(list: &mut PinList, index: usize) -> crate::CursorMut<'_, PinListTypes> {
-            let mut cursor = list.cursor_front_mut();
-            for _ in 0..index {
-                cursor.move_next();
-                cursor.protected().unwrap();
-            }
-            cursor
-        }
-
-        // ghost before; ghost after
-        list.cursor_ghost_mut()
-            .insert_before(node0.as_mut(), Box::new(0), [0; 0]);
-        assert_order(&mut list, [0]);
-
-        // ghost before; node after; insert_after
-        list.cursor_ghost_mut()
-            .insert_after(node1.as_mut(), Box::new(1), [1; 1]);
-        assert_order(&mut list, [1, 0]);
-
-        // ghost before; node after; insert_before
-        cursor(&mut list, 0).insert_before(node2.as_mut(), Box::new(2), [2; 2]);
-        assert_order(&mut list, [2, 1, 0]);
-
-        // node before; ghost after; insert_after
-        cursor(&mut list, 2).insert_after(node3.as_mut(), Box::new(3), [3; 3]);
-        assert_order(&mut list, [2, 1, 0, 3]);
-
-        // node before; ghost after; insert_before
-        list.cursor_ghost_mut()
-            .insert_before(node4.as_mut(), Box::new(4), [4; 4]);
-        assert_order(&mut list, [2, 1, 0, 3, 4]);
-
-        // node before; node after; insert_after
-        cursor(&mut list, 0).insert_after(node5.as_mut(), Box::new(5), [5; 5]);
-        assert_order(&mut list, [2, 5, 1, 0, 3, 4]);
-
-        // node before; node after; insert_before
-        cursor(&mut list, 1).insert_before(node6.as_mut(), Box::new(6), [6; 6]);
-        assert_order(&mut list, [2, 6, 5, 1, 0, 3, 4]);
-
-        fn unlink<const N: usize>(
-            list: &mut PinList,
-            node: Pin<&mut crate::Node<PinListTypes, [u32; N]>>,
-            index: usize,
-        ) {
-            let node = node.initialized_mut().expect("already unlinked");
-            let (protected, unprotected) = node.unlink(list).unwrap();
-            assert_eq!(*protected as usize, index);
-            assert_eq!(unprotected.len(), index);
-        }
-
-        fn remove<const N: usize>(
-            list: &mut PinList,
-            node: Pin<&mut crate::Node<PinListTypes, [u32; N]>>,
-            index: u16,
-        ) {
-            let node = node.initialized_mut().expect("already unlinked");
-            let mut cursor = node.cursor_mut(&mut *list).unwrap();
-            let removed = Box::new(index);
-            assert_eq!(u16::from(*cursor.remove_current(removed).unwrap()), index);
-            let (removed, unprotected) = node.take_removed(&*list).unwrap();
-            assert_eq!(*removed, index);
-            assert_eq!(unprotected.len(), index as usize);
-        }
-
-        // node before; node after; unlink
-        unlink(&mut list, node6.as_mut(), 6);
-        assert_order(&mut list, [2, 5, 1, 0, 3, 4]);
-
-        // node before; node after; remove
-        remove(&mut list, node5.as_mut(), 5);
-        assert_order(&mut list, [2, 1, 0, 3, 4]);
-
-        // node before; ghost after; unlink
-        unlink(&mut list, node4.as_mut(), 4);
-        assert_order(&mut list, [2, 1, 0, 3]);
-
-        // node before; ghost after; remove
-        remove(&mut list, node3.as_mut(), 3);
-        assert_order(&mut list, [2, 1, 0]);
-
-        // ghost before; node after; unlink
-        unlink(&mut list, node2.as_mut(), 2);
-        assert_order(&mut list, [1, 0]);
-
-        // ghost before; node after; remove
-        remove(&mut list, node1.as_mut(), 1);
-        assert_order(&mut list, [0]);
-
-        // ghost before; ghost after; unlink
-        unlink(&mut list, node0.as_mut(), 0);
-        assert_order(&mut list, []);
+        let val = Arc::pin(Node::new(1));
+        list1.push_back(val.clone()).unwrap();
+        list2.push_back(val).unwrap_err();
     }
 }

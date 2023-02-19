@@ -9,7 +9,18 @@ use core::fmt::Debug;
 ///
 /// It must not be possible to create an arbitrary ID that is equal to one that already exists
 /// without cloning that exact ID.
-pub unsafe trait Id: Sized + Copy + PartialEq + Eq + Debug {}
+pub unsafe trait Id: Sized + Copy + PartialEq + Eq + Debug + 'static {
+    /// An atomic representation of this `Id`
+    type Atomic: 'static;
+    /// Read the atomic representation using `Relaxed` ordering
+    fn read_relaxed(this: &Self::Atomic) -> Option<Self>;
+    /// Create a new atomic representation of `None` id.
+    fn unset() -> Self::Atomic;
+    /// Acquire the lock on this `Id`
+    fn acquire(&self, this: &Self::Atomic) -> bool;
+    /// Release the lock on this `Id`
+    fn release(&self, this: &Self::Atomic) -> bool;
+}
 
 /// A wrapper around an ID that asserts it is unique.
 ///
@@ -80,7 +91,47 @@ mod checked {
     }
 
     // SAFETY: `new` can never return two `u64`s with the same value.
-    unsafe impl Id for Checked {}
+    unsafe impl Id for Checked {
+        type Atomic = AtomicU64;
+
+        fn read_relaxed(this: &Self::Atomic) -> Option<Self> {
+            NonZeroU64::new(this.load(atomic::Ordering::Relaxed)).map(Self)
+        }
+
+        fn acquire(&self, this: &Self::Atomic) -> bool {
+            loop {
+                match this.compare_exchange_weak(
+                    0,
+                    self.0.get(),
+                    atomic::Ordering::Acquire,
+                    atomic::Ordering::Relaxed,
+                ) {
+                    Err(0) => continue,
+                    Err(_) => break false,
+                    Ok(_) => break true,
+                }
+            }
+        }
+
+        fn release(&self, this: &Self::Atomic) -> bool {
+            loop {
+                match this.compare_exchange_weak(
+                    self.0.get(),
+                    0,
+                    atomic::Ordering::Release,
+                    atomic::Ordering::Relaxed,
+                ) {
+                    Err(x) if x == self.0.get() => continue,
+                    Err(_) => break false,
+                    Ok(_) => break true,
+                }
+            }
+        }
+
+        fn unset() -> Self::Atomic {
+            AtomicU64::new(0)
+        }
+    }
 }
 pub use checked::Checked;
 
@@ -109,7 +160,23 @@ mod unchecked {
     }
 
     // SAFETY: Ensured by caller in `Unchecked::new`
-    unsafe impl Id for Unchecked {}
+    unsafe impl Id for Unchecked {
+        type Atomic = ();
+        
+        fn read_relaxed(_this: &()) -> Option<Self> {
+            Some(Unchecked)
+        }
+
+        fn acquire(&self, _this: &()) -> bool {
+            true
+        }
+
+        fn release(&self, _this: &()) -> bool {
+            true
+        }
+
+        fn unset() -> Self::Atomic {}
+    }
 }
 pub use unchecked::Unchecked;
 
@@ -149,38 +216,37 @@ mod debug_checked {
     }
 
     // SAFETY: Ensured by caller in `DebugChecked::new`
-    unsafe impl Id for DebugChecked {}
-}
-pub use debug_checked::DebugChecked;
+    unsafe impl Id for DebugChecked {
+        #[cfg(debug_assertions)]
+        type Atomic = <id::Checked as Id>::Atomic;
+        #[cfg(not(debug_assertions))]
+        type Atomic = ();
 
-mod lifetime {
-    use super::Id;
-    use super::Unique;
-    use core::marker::PhantomData;
-
-    /// A fully statically checked ID based on invariant lifetimes and HRTBs.
-    ///
-    /// This is the same technique as used by `GhostCell`. While theoretically the best option
-    /// (being both safe and zero-cost), its infectious nature makes it not very useful in practice.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Lifetime<'id> {
-        invariant: PhantomData<fn(&'id ()) -> &'id ()>,
-    }
-
-    impl Lifetime<'_> {
-        /// Create a new lifetime-based ID usable in a specific scope.
-        pub fn scope<O, F>(f: F) -> O
-        where
-            F: for<'id> FnOnce(Unique<Lifetime<'id>>) -> O,
-        {
-            f(unsafe {
-                Unique::new(Lifetime {
-                    invariant: PhantomData,
-                })
+        fn read_relaxed(this: &Self::Atomic) -> Option<Self> {
+            Some(Self {
+                #[cfg(debug_assertions)]
+                checked: id::Checked::read_relaxed(this)?,
             })
         }
-    }
 
-    unsafe impl Id for Lifetime<'_> {}
+        fn acquire(&self, this: &Self::Atomic) -> bool {
+            #[cfg(debug_assertions)]
+            return self.checked.acquire(this);
+            #[cfg(not(debug_assertions))]
+            true
+        }
+
+        fn release(&self, this: &Self::Atomic) -> bool {
+            #[cfg(debug_assertions)]
+            return self.checked.release(this);
+            #[cfg(not(debug_assertions))]
+            true
+        }
+
+        fn unset() -> Self::Atomic {
+            #[cfg(debug_assertions)]
+            id::Checked::unset()
+        }
+    }
 }
-pub use lifetime::Lifetime;
+pub use debug_checked::DebugChecked;

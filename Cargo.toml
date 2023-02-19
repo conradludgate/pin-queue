@@ -1,14 +1,15 @@
 [package]
-name = "unsized-pin-list"
+name = "pin-queue"
 version = "0.1.0"
 edition = "2021"
-description = "A safe `Pin`-based intrusive doubly linked list for storing unsized data"
+description = "A safe `Pin`-based intrusive linked list queue"
 repository = "https://github.com/conradludgate/unsized-pin-list.rs"
 license = "MIT"
-keywords = ["PinList", "Unsize"]
+keywords = ["PinQueue"]
 categories = ["data-structures", "no-std"]
 
 [features]
+default = ["std"]
 alloc = []
 std = ["alloc"]
 
@@ -18,6 +19,7 @@ pinned-aliasable = "0.1.3"
 
 [dev-dependencies]
 pin-utils = "0.1.0"
+once_cell = "1"
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "doc_nightly"]
