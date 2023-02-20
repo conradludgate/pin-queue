@@ -6,7 +6,7 @@ description = "A safe `Pin`-based intrusive linked list queue"
 repository = "https://github.com/conradludgate/unsized-pin-list.rs"
 license = "MIT"
 keywords = ["PinQueue"]
-categories = ["data-structures", "no-std"]
+categories = ["data-structures"]
 
 [dependencies]
 

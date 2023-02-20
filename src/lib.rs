@@ -1,4 +1,60 @@
 //! This crate provides [`PinQueue`], a safe `Pin`-based intrusive linked list for a FIFO queue.
+//!
+/*! ```
+use std::sync::Arc;
+use std::pin::Pin;
+
+// define your node type (using pin-projection to project the intrusive node)
+pin_project_lite::pin_project!(
+    struct Node<V: ?Sized> {
+        #[pin]
+        intrusive: pin_queue::Intrusive<QueueTypes>,
+        value: V,
+    }
+);
+
+impl<V> Node<V> {
+    pub fn new(value: V) -> Self {
+        Self {
+            intrusive: pin_queue::Intrusive::new(),
+            value,
+        }
+    }
+}
+
+// Define how to acquire the intrusive values from the node
+struct Key;
+impl pin_queue::GetIntrusive<QueueTypes> for Key {
+    fn get_intrusive(
+        p: Pin<&Node<dyn std::fmt::Display>>
+    ) -> Pin<&pin_queue::Intrusive<QueueTypes>> {
+        p.project_ref().intrusive
+    }
+}
+
+// alias of all the relevant types
+type QueueTypes = dyn pin_queue::Types<
+    // with checked IDs
+    Id = pin_queue::id::Checked,
+    // with this intrusive key
+    Key = Key,
+    // storing this pointer
+    Pointer = Arc<Node<dyn std::fmt::Display>>
+>;
+
+let mut queue = pin_queue::PinQueue::<QueueTypes>::new(pin_queue::id::Checked::new());
+
+// can push to the back
+queue.push_back(Arc::pin(Node::new(1))).unwrap();
+// can push many types
+queue.push_back(Arc::pin(Node::new("hello"))).unwrap();
+
+// can pop from the front
+assert_eq!(queue.pop_front().unwrap().value.to_string(), "1");
+assert_eq!(queue.pop_front().unwrap().value.to_string(), "hello");
+
+assert!(queue.pop_front().is_none());
+``` */
 #![warn(
     clippy::pedantic,
     missing_debug_implementations,
@@ -19,24 +75,21 @@
 )]
 
 pub mod id;
-use core::{cell::UnsafeCell, fmt, ops::Deref, pin::Pin, ptr::NonNull};
-use std::sync::Arc;
+use core::{cell::UnsafeCell, fmt, ops::Deref, pin::Pin};
+use std::{mem::ManuallyDrop, sync::Arc};
 
-// use arc_dyn::{Core, ThinArc};
-pub use id::Id;
-
-mod util;
+use crate::id::Id;
 
 /// Types used in a [`PinQueue`]. This trait is used to avoid an excessive number of generic
 /// parameters on [`PinQueue`] and related types.
 pub trait Types: 'static {
-    /// The ID type this list uses to ensure that different [`PinList`]s are not mixed up.
+    /// The ID type this list uses to ensure that different [`PinQueue`]s are not mixed up.
     ///
     /// This crate provides a couple built-in ID types, but you can also define your own:
     /// - [`id::Checked`]:
     ///     IDs are allocated with a single global atomic `u64` counter.
     /// - [`id::Unchecked`]:
-    ///     The responsibility is left up to the user to ensure that different [`PinList`]s are not
+    ///     The responsibility is left up to the user to ensure that different [`PinQueue`]s are not
     ///     incorrectly mixed up. Using this is `unsafe`.
     /// - [`id::DebugChecked`]:
     ///     Equivalent to [`id::Checked`] when `debug_assertions` are enabled, but
@@ -47,7 +100,7 @@ pub trait Types: 'static {
     type Key;
 
     /// The pointer type that will be stored in the queue
-    type Pointer: Pointer;
+    type Pointer: SharedPointer;
 }
 
 /// Gets the intrusive component out of a node
@@ -63,23 +116,11 @@ where
 {
     id: T::Id,
     pointers: Option<ListPointers<T>>,
-    // /// The head of the list.
-    // ///
-    // /// If this is `None`, the list is empty.
-    // head: Option<Pin<T::Pointer>>,
-
-    // /// The tail of the list.
-    // ///
-    // /// Whether this is `None` must remain in sync with whether `head` is `None`.
-    // tail: Option<NonNull<<T::Pointer as Deref>::Target>>,
 }
 
 struct ListPointers<T: Types + ?Sized> {
-    /// The head of the list.
     head: Pin<T::Pointer>,
-
-    /// The tail of the list.
-    tail: NonNull<<T::Pointer as Deref>::Target>,
+    tail: ManuallyDrop<Pin<T::Pointer>>,
 }
 
 impl<T: ?Sized + Types> fmt::Debug for PinQueue<T>
@@ -92,37 +133,15 @@ where
 }
 
 /// `Pointer` trait represents an aliasable read-only shared-ownership pointer.
-pub trait Pointer: Deref + 'static + Sized {
-    /// Turn this pointer into a raw pointer
-    fn as_raw(&self) -> *const Self::Target;
+///
+/// # Safety
+/// Type must be an aliasable pointer
+pub unsafe trait SharedPointer: Deref + 'static + Sized {}
 
-    // /// # Safety
-    // /// Must only be called **once** with the output of from [`into_raw`](Pointer::into_raw)
-    // unsafe fn from_raw(p: *const Self::Target) -> Self;
-}
+// Safety: Arc is aliasable
+unsafe impl<T: ?Sized + 'static> SharedPointer for Arc<T> {}
 
-// impl<T: ?Sized + 'static> Pointer for Box<T> {
-//     fn into_raw(self) -> *const T {
-//         Box::into_raw(self)
-//     }
-
-//     unsafe fn from_raw(p: *const T) -> Self {
-//         // SAFETY: guaranteed by caller
-//         unsafe { Box::from_raw(p as _) }
-//     }
-// }
-
-impl<T: ?Sized + 'static> Pointer for Arc<T> {
-    fn as_raw(&self) -> *const T {
-        Arc::as_ptr(self)
-    }
-    // unsafe fn from_raw(p: *const T) -> Self {
-    //     // SAFETY: guaranteed by caller
-    //     unsafe { Arc::from_raw(p) }
-    // }
-}
-
-/// The error returned by [`PinQueue::push_back`] when the [`Node`] is already in a [`PinQueue`]
+/// The error returned by [`PinQueue::push_back`] when the node is already in a [`PinQueue`]
 pub struct AlreadyInsertedError<P>(pub Pin<P>);
 
 impl<P> fmt::Debug for AlreadyInsertedError<P> {
@@ -164,27 +183,19 @@ where
         {
             return Err(AlreadyInsertedError(node));
         };
-        let node = unsafe { Pin::into_inner_unchecked(node) };
-        let tail_node = unsafe { NonNull::new_unchecked(node.as_raw() as *mut _) };
-        let node = unsafe { Pin::new_unchecked(node) };
+        // initiate a copy of the pointer. This is fine because `T::Pointer` guarantees this is
+        // an aliasable type, and we will never drop this copy
+        let tail = unsafe { ManuallyDrop::new(std::ptr::read(&node)) };
 
         let pointers = match self.pointers.take() {
             Some(mut pointers) => {
-                unsafe {
-                    (*<T::Key as GetIntrusive<T>>::get_intrusive(Pin::new_unchecked(
-                        pointers.tail.as_ref(),
-                    ))
-                    .pointers
-                    .get())
-                    .next = Some(node);
-                }
-                pointers.tail = tail_node;
+                let intrusive = <T::Key as GetIntrusive<T>>::get_intrusive(pointers.tail.as_ref());
+                let old = unsafe { (*intrusive.next.get()).replace(node) };
+                debug_assert!(old.is_none());
+                pointers.tail = tail;
                 pointers
             }
-            None => ListPointers {
-                head: node,
-                tail: tail_node,
-            },
+            None => ListPointers { head: node, tail },
         };
         self.pointers = Some(pointers);
         Ok(())
@@ -195,7 +206,7 @@ where
         let mut pointers = self.pointers.take()?;
         let node = pointers.head;
         let intrusive = <T::Key as GetIntrusive<T>>::get_intrusive(node.as_ref());
-        if let Some(next) = unsafe { (*intrusive.pointers.get()).next.take() } {
+        if let Some(next) = unsafe { (*intrusive.next.get()).take() } {
             pointers.head = next;
             self.pointers = Some(pointers);
         };
@@ -204,37 +215,16 @@ where
     }
 }
 
-unsafe impl<T: ?Sized + Types> Send for Intrusive<T> where <T::Id as id::Id>::Atomic: Send {}
+// unsafe impl<T: ?Sized + Types> Send for Intrusive<T> where <T::Id as id::Id>::Atomic: Send {}
 
-unsafe impl<T: ?Sized + Types> Sync for Intrusive<T> where
-    // Required because it is owned by this type and will be dropped by it.
-    <T::Id as id::Id>::Atomic: Sync
-{
-}
-
-unsafe impl<T: ?Sized + Types> Send for PinQueue<T>
-where
-    T::Id: Send,
-    <T::Pointer as Deref>::Target: Send + Sync,
-    T::Pointer: Send,
-    T::Key: GetIntrusive<T>,
-{
-}
-
-unsafe impl<T: ?Sized + Types> Sync for PinQueue<T>
-where
-    T::Id: Sync,
-    <T::Pointer as Deref>::Target: Send + Sync,
-    T::Pointer: Sync,
-    T::Key: GetIntrusive<T>,
-{
-}
+// Same bounds as Mutex
+unsafe impl<T: ?Sized + Types> Sync for Intrusive<T> where T::Pointer: Send {}
 
 /// The intrusive type that you stuff into your node
 pub struct Intrusive<T: Types + ?Sized> {
     pub(crate) lock: <T::Id as id::Id>::Atomic,
     // locked by the `lock` field
-    pub(crate) pointers: UnsafeCell<Pointers<T>>,
+    pub(crate) next: UnsafeCell<Option<Pin<T::Pointer>>>,
 }
 
 impl<T: ?Sized + Types> fmt::Debug for Intrusive<T> {
@@ -245,18 +235,13 @@ impl<T: ?Sized + Types> fmt::Debug for Intrusive<T> {
     }
 }
 
-struct Pointers<T: Types + ?Sized> {
-    /// The next node in the linked list.
-    pub(crate) next: Option<Pin<T::Pointer>>,
-}
-
 impl<T: Types + ?Sized> Intrusive<T> {
     /// Create a new node
     #[must_use]
     pub fn new() -> Self {
         Self {
             lock: <T::Id as id::Id>::unset(),
-            pointers: UnsafeCell::new(Pointers { next: None }),
+            next: UnsafeCell::new(None),
         }
     }
 }
@@ -282,15 +267,19 @@ mod tests {
     use core::pin::Pin;
     use std::sync::Arc;
 
-    type MyTypes = dyn crate::Types<Id = id::Checked, Key = Key, Pointer = Arc<Node<dyn Display>>>;
+    type MyTypes = dyn crate::Types<
+        Id = id::Checked,
+        Key = Key,
+        Pointer = Arc<ThisIsAReallyLongTypeName<dyn Display>>,
+    >;
     pin_project_lite::pin_project!(
-        struct Node<V: ?Sized> {
+        struct ThisIsAReallyLongTypeName<V: ?Sized> {
             #[pin]
             intrusive: crate::Intrusive<MyTypes>,
             value: V,
         }
     );
-    impl<V> Node<V> {
+    impl<V> ThisIsAReallyLongTypeName<V> {
         pub fn new(value: V) -> Self {
             Self {
                 intrusive: crate::Intrusive::new(),
@@ -300,7 +289,9 @@ mod tests {
     }
     struct Key;
     impl crate::GetIntrusive<MyTypes> for Key {
-        fn get_intrusive(p: Pin<&Node<dyn Display>>) -> Pin<&crate::Intrusive<MyTypes>> {
+        fn get_intrusive(
+            p: Pin<&ThisIsAReallyLongTypeName<dyn Display>>,
+        ) -> Pin<&crate::Intrusive<MyTypes>> {
             p.project_ref().intrusive
         }
     }
@@ -308,8 +299,10 @@ mod tests {
     #[test]
     fn my_list() {
         let mut list = PinQueue::<MyTypes>::new(id::Checked::new());
-        list.push_back(Arc::pin(Node::new(1))).unwrap();
-        list.push_back(Arc::pin(Node::new("hello"))).unwrap();
+        list.push_back(Arc::pin(ThisIsAReallyLongTypeName::new(1)))
+            .unwrap();
+        list.push_back(Arc::pin(ThisIsAReallyLongTypeName::new("hello")))
+            .unwrap();
 
         assert_eq!(list.pop_front().unwrap().value.to_string(), "1");
         assert_eq!(list.pop_front().unwrap().value.to_string(), "hello");
@@ -321,8 +314,17 @@ mod tests {
         let mut list1 = PinQueue::<MyTypes>::new(id::Checked::new());
         let mut list2 = PinQueue::<MyTypes>::new(id::Checked::new());
 
-        let val = Arc::pin(Node::new(1));
+        let val = Arc::pin(ThisIsAReallyLongTypeName::new(1));
         list1.push_back(val.clone()).unwrap();
         list2.push_back(val).unwrap_err();
+    }
+
+    #[test]
+    fn my_list_push_back_same_error() {
+        let mut list = PinQueue::<MyTypes>::new(id::Checked::new());
+
+        let val = Arc::pin(ThisIsAReallyLongTypeName::new(1));
+        list.push_back(val.clone()).unwrap();
+        list.push_back(val).unwrap_err();
     }
 }

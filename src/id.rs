@@ -1,6 +1,5 @@
 //! Unique IDs.
 
-use crate::util::ConstFnBounds;
 use core::fmt::Debug;
 
 /// A marker trait for any type that functions as an ID.
@@ -11,7 +10,7 @@ use core::fmt::Debug;
 /// without cloning that exact ID.
 pub unsafe trait Id: Sized + Copy + PartialEq + Eq + Debug + 'static {
     /// An atomic representation of this `Id`
-    type Atomic: 'static;
+    type Atomic: Sync + 'static;
     /// Read the atomic representation using `Relaxed` ordering
     fn read_relaxed(this: &Self::Atomic) -> Option<Self>;
     /// Create a new atomic representation of `None` id.
@@ -31,10 +30,7 @@ pub struct Unique<I: Id> {
     id: I,
 }
 
-impl<I> Unique<I>
-where
-    <I as ConstFnBounds>::Type: Id,
-{
+impl<I: Id> Unique<I> {
     /// Create a new `Unique`, asserting that the given ID contained within is unique.
     ///
     /// # Safety
@@ -78,7 +74,7 @@ mod checked {
             // Ensure overflows don't happen. Abort instead of panicking so it can't be recovered
             // from.
             if id >= MAX_ID {
-                crate::util::abort();
+                std::process::abort();
             }
 
             // SAFETY: `COUNTER` starts at one and the above `assert!` ensures that it never
