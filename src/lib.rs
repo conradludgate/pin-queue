@@ -62,16 +62,24 @@ where
     T::Key: GetIntrusive<T>,
 {
     id: T::Id,
+    pointers: Option<ListPointers<T>>,
+    // /// The head of the list.
+    // ///
+    // /// If this is `None`, the list is empty.
+    // head: Option<Pin<T::Pointer>>,
 
+    // /// The tail of the list.
+    // ///
+    // /// Whether this is `None` must remain in sync with whether `head` is `None`.
+    // tail: Option<NonNull<<T::Pointer as Deref>::Target>>,
+}
+
+struct ListPointers<T: Types + ?Sized> {
     /// The head of the list.
-    ///
-    /// If this is `None`, the list is empty.
-    head: Option<NonNull<<T::Pointer as Deref>::Target>>,
+    head: Pin<T::Pointer>,
 
     /// The tail of the list.
-    ///
-    /// Whether this is `None` must remain in sync with whether `head` is `None`.
-    tail: Option<NonNull<<T::Pointer as Deref>::Target>>,
+    tail: NonNull<<T::Pointer as Deref>::Target>,
 }
 
 impl<T: ?Sized + Types> fmt::Debug for PinQueue<T>
@@ -83,36 +91,35 @@ where
     }
 }
 
-/// `Pointer` trait represents types that act like owned pointers.
-/// Eg [`Box`] or [`Arc`]
-pub trait Pointer: Deref + 'static {
+/// `Pointer` trait represents an aliasable read-only shared-ownership pointer.
+pub trait Pointer: Deref + 'static + Sized {
     /// Turn this pointer into a raw pointer
-    fn into_raw(self) -> *const Self::Target;
-    /// # Safety
-    /// Must only be called **once** with the output of from [`into_raw`](Pointer::into_raw)
-    unsafe fn from_raw(p: *const Self::Target) -> Self;
+    fn as_raw(&self) -> *const Self::Target;
+
+    // /// # Safety
+    // /// Must only be called **once** with the output of from [`into_raw`](Pointer::into_raw)
+    // unsafe fn from_raw(p: *const Self::Target) -> Self;
 }
 
-impl<T: ?Sized + 'static> Pointer for Box<T> {
-    fn into_raw(self) -> *const T {
-        Box::into_raw(self)
-    }
+// impl<T: ?Sized + 'static> Pointer for Box<T> {
+//     fn into_raw(self) -> *const T {
+//         Box::into_raw(self)
+//     }
 
-    unsafe fn from_raw(p: *const T) -> Self {
-        // SAFETY: guaranteed by caller
-        unsafe { Box::from_raw(p as _) }
-    }
-}
+//     unsafe fn from_raw(p: *const T) -> Self {
+//         // SAFETY: guaranteed by caller
+//         unsafe { Box::from_raw(p as _) }
+//     }
+// }
 
 impl<T: ?Sized + 'static> Pointer for Arc<T> {
-    fn into_raw(self) -> *const T {
-        Arc::into_raw(self)
+    fn as_raw(&self) -> *const T {
+        Arc::as_ptr(self)
     }
-
-    unsafe fn from_raw(p: *const T) -> Self {
-        // SAFETY: guaranteed by caller
-        unsafe { Arc::from_raw(p) }
-    }
+    // unsafe fn from_raw(p: *const T) -> Self {
+    //     // SAFETY: guaranteed by caller
+    //     unsafe { Arc::from_raw(p) }
+    // }
 }
 
 /// The error returned by [`PinQueue::push_back`] when the [`Node`] is already in a [`PinQueue`]
@@ -139,8 +146,7 @@ where
     pub fn new(id: id::Unique<T::Id>) -> Self {
         PinQueue {
             id: id.into_inner(),
-            head: None,
-            tail: None,
+            pointers: None,
         }
     }
 
@@ -159,26 +165,40 @@ where
             return Err(AlreadyInsertedError(node));
         };
         let node = unsafe { Pin::into_inner_unchecked(node) };
-        let node = unsafe { NonNull::new_unchecked(node.into_raw() as *mut _) };
-        if let Some(tail) = self.tail {
-            unsafe {
-                (*<T::Key as GetIntrusive<T>>::get_intrusive(Pin::new_unchecked(tail.as_ref()))
+        let tail_node = unsafe { NonNull::new_unchecked(node.as_raw() as *mut _) };
+        let node = unsafe { Pin::new_unchecked(node) };
+
+        let pointers = match self.pointers.take() {
+            Some(mut pointers) => {
+                unsafe {
+                    (*<T::Key as GetIntrusive<T>>::get_intrusive(Pin::new_unchecked(
+                        pointers.tail.as_ref(),
+                    ))
                     .pointers
                     .get())
-                .next = Some(node);
+                    .next = Some(node);
+                }
+                pointers.tail = tail_node;
+                pointers
             }
-        }
-        self.head = Some(self.head.unwrap_or(node));
-        self.tail = Some(node);
+            None => ListPointers {
+                head: node,
+                tail: tail_node,
+            },
+        };
+        self.pointers = Some(pointers);
         Ok(())
     }
 
     /// Take the first node from the queue
     pub fn pop_front(&mut self) -> Option<Pin<T::Pointer>> {
-        let node = self.head?;
-        let node = unsafe { Pin::new_unchecked(T::Pointer::from_raw(node.as_ptr())) };
+        let mut pointers = self.pointers.take()?;
+        let node = pointers.head;
         let intrusive = <T::Key as GetIntrusive<T>>::get_intrusive(node.as_ref());
-        self.head = unsafe { (*intrusive.pointers.get()).next };
+        if let Some(next) = unsafe { (*intrusive.pointers.get()).next.take() } {
+            pointers.head = next;
+            self.pointers = Some(pointers);
+        };
         debug_assert!(self.id.release(&intrusive.lock));
         Some(node)
     }
@@ -227,7 +247,7 @@ impl<T: ?Sized + Types> fmt::Debug for Intrusive<T> {
 
 struct Pointers<T: Types + ?Sized> {
     /// The next node in the linked list.
-    pub(crate) next: Option<NonNull<<T::Pointer as Deref>::Target>>,
+    pub(crate) next: Option<Pin<T::Pointer>>,
 }
 
 impl<T: Types + ?Sized> Intrusive<T> {
