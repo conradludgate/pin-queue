@@ -210,7 +210,8 @@ where
             pointers.head = next;
             self.pointers = Some(pointers);
         };
-        debug_assert!(self.id.release(&intrusive.lock));
+        let released = self.id.release(&intrusive.lock);
+        debug_assert!(released);
         Some(node)
     }
 }
@@ -222,7 +223,7 @@ unsafe impl<T: ?Sized + Types> Sync for Intrusive<T> where T::Pointer: Send {}
 
 /// The intrusive type that you stuff into your node
 pub struct Intrusive<T: Types + ?Sized> {
-    pub(crate) lock: <T::Id as id::Id>::Atomic,
+    pub(crate) lock: <T::Id as Id>::Atomic,
     // locked by the `lock` field
     pub(crate) next: UnsafeCell<Option<Pin<T::Pointer>>>,
 }
@@ -230,7 +231,7 @@ pub struct Intrusive<T: Types + ?Sized> {
 impl<T: ?Sized + Types> fmt::Debug for Intrusive<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Intrusive")
-            .field("id", &<T::Id as id::Id>::read_relaxed(&self.lock))
+            .field("id", &T::Id::read_relaxed(&self.lock))
             .finish()
     }
 }
@@ -240,7 +241,7 @@ impl<T: Types + ?Sized> Intrusive<T> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            lock: <T::Id as id::Id>::unset(),
+            lock: T::Id::unset(),
             next: UnsafeCell::new(None),
         }
     }
@@ -304,8 +305,11 @@ mod tests {
         list.push_back(Arc::pin(ThisIsAReallyLongTypeName::new("hello")))
             .unwrap();
 
-        assert_eq!(list.pop_front().unwrap().value.to_string(), "1");
+        let task1 = list.pop_front().unwrap();
+        assert_eq!(task1.value.to_string(), "1");
+        list.push_back(task1).unwrap();
         assert_eq!(list.pop_front().unwrap().value.to_string(), "hello");
+        assert_eq!(list.pop_front().unwrap().value.to_string(), "1");
         assert!(list.pop_front().is_none());
     }
 

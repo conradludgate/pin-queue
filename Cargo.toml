@@ -1,6 +1,6 @@
 [package]
 name = "pin-queue"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A safe `Pin`-based intrusive linked list queue"
 repository = "https://github.com/conradludgate/unsized-pin-list.rs"
@@ -12,4 +12,3 @@ categories = ["data-structures"]
 
 [dev-dependencies]
 pin-project-lite = "0.2"
-
